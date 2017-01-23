@@ -6,7 +6,7 @@ CREATE DATABASE git_insights WITH
 
 
  CREATE TABLE commit_file_changes(
-    id SERIAL,
+    id serial CONSTRAINT pk_commit_file_changes PRIMARY KEY,
     commit_sha VARCHAR,
     commit_parent_sha VARCHAR,
     commit_date DATE,

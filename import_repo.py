@@ -11,6 +11,7 @@ import csv
 import sys
 import psycopg2
 import threading
+from threading import Thread, Event
 import queue
 
 pp = pprint.PrettyPrinter(depth=6)
@@ -250,67 +251,149 @@ def scan_repo_to_csv(repo_path, csv_path):
                 ])
 
 class PsqlStatementParallelizer:
-    threads = 4
-    def __init__(self, threads = 4):
-        self.threads = 4
+    """This must be called with with.."""
+    parallelism = 4
+    threads = []
+    commits = None
+    stopped_event = Event()
+    connection_string = None
+
+    def __init__(self, connection_string, threads = 4):
+        myself = self
+        self.parallelism = threads
+        self.connection_string = connection_string
+        for i in range(0, self.parallelism):
+            self.threads.append(Thread(target = self.pop_and_insert_ad_infinitum))
+    
+    def __enter__(self):
+        self.commits = queue.Queue()
+        for t in self.threads:
+            t.start()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        # all threads must die
+        self.stopped_event.set()
+        for t in self.threads:
+            t.join()
+
+    def stop(self):
+        self.stopped_event.set()
+
+    def __insert_commit__(self, commit, cursor):
+        for file in commit.file_diffs:
+            cursor.execute("""
+                INSERT INTO commit_file_changes(
+                    commit_sha,
+                    commit_parent_sha,
+                    commit_date,
+                    author_timeofday,
+                    commit_email,
+                    commit_author,
+                    commit_message_length,
+                    commit_message_words,
+                    commit_lines_added,
+                    commit_lines_deleted,
+                    commit_file_count,
+                    file_change_type,
+                    file_path_old,
+                    file_path_new,
+                    file_lines_old,
+                    file_lines_new,
+                    file_lines_added,
+                    file_lines_deleted,
+                    file_hunk_count,
+                    file_hunk_min_size,
+                    file_hunk_max_size,
+                    file_hunk_avg_size)
+                VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                commit.sha,
+                commit.parent_sha,
+                datetime.fromtimestamp(commit.date),
+                commit.author_timeofday,
+                commit.email, 
+                commit.author,
+                commit.message_length,
+                commit.message_words,
+                commit.lines_added,
+                commit.lines_deleted,
+                len(commit.file_diffs),
+                file.change_type,
+                file.path_old,
+                file.path_new,
+                file.lines_total_old,
+                file.lines_total_new,
+                file.lines_added,
+                file.lines_deleted,
+                file.hunk_count,
+                file.hunk_min_size,
+                file.hunk_max_size,
+                file.hunk_avg_size
+            ));
+                        
+
+    def pop_and_insert_ad_infinitum(self):
+        print("self is this:", self)
+        with psycopg2.connect(self.connection_string) as conn:
+            with conn.cursor() as curs:
+                while not self.is_stopped():
+                    commit_batch = []
+                    try:
+                        commit_batch.append(self.commits.get(timeout = 1))
+                    except queue.Empty:
+                        continue
         
+                    # try to read 100 items, but give up whenever we can't read an item in 5ms
+                    while len(commit_batch) < 100:
+                        try:
+                            commit_batch.append(self.commits.get(timeout = 0.5))
+                            #print("got some more commits, batch size is now %d" % len(commit_batch))
+                        except queue.Empty:
+                            #print("done waiting for new element, all I got is a batch of %d" % len(commit_batch))
+                            break
+        
+                    if len(commit_batch) == 0:
+                        continue
+        
+                    # we've got a batch! let's execute it
+                    for commit in commit_batch:
+                        try: 
+                            self.__insert_commit__(commit, curs)
+                        except BaseException as e:
+                            print("Exception while inserting commit", e)
+                            quit()
+                            
+                    print("Committing txn for %d commits from thread %s" % (len(commit_batch), threading.current_thread().name))
+                    try:
+                        conn.commit()
+                    except BaseException as e:
+                        print("Exception while committing batch", e)
+                        quit()
+                
+                print("Thread %s detected event to stop" % threading.current_thread().name)
+
+                
+    def add_commit(self, commit):
+        if not self.commits:
+            raise(Exception("Cannot use " + self.__class__.__name__ + " outside of an with() statement"))
+        #print("adding a commit to the queue of ~size %d" % self.commits.qsize())
+        self.commits.put(commit)        
+        
+    def is_stopped(self):
+        return self.stopped_event.is_set()
+
 
 def scan_repo_to_postgresql(repo_path, psql_conn_string):
     repo = Repo.discover(repo_path)
-    with psycopg2.connect(psql_conn_string) as conn:
-        with conn.cursor() as curs:
+    with PsqlStatementParallelizer(psql_conn_string) as para:
+        try:
             for commit in walk_repo(repo):
-                for file in commit.file_diffs:
-                    curs.execute("""
-                        INSERT INTO commit_file_changes(
-                            commit_sha,
-                            commit_parent_sha,
-                            commit_date,
-                            author_timeofday,
-                            commit_email,
-                            commit_author,
-                            commit_message_length,
-                            commit_message_words,
-                            commit_lines_added,
-                            commit_lines_deleted,
-                            commit_file_count,
-                            file_change_type,
-                            file_path_old,
-                            file_path_new,
-                            file_lines_old,
-                            file_lines_new,
-                            file_lines_added,
-                            file_lines_deleted,
-                            file_hunk_count,
-                            file_hunk_min_size,
-                            file_hunk_max_size,
-                            file_hunk_avg_size)
-                        VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (
-                        commit.sha,
-                        commit.parent_sha,
-                        datetime.fromtimestamp(commit.date),
-                        commit.author_timeofday,
-                        commit.email, 
-                        commit.author,
-                        commit.message_length,
-                        commit.message_words,
-                        commit.lines_added,
-                        commit.lines_deleted,
-                        len(commit.file_diffs),
-                        file.change_type,
-                        file.path_old,
-                        file.path_new,
-                        file.lines_total_old,
-                        file.lines_total_new,
-                        file.lines_added,
-                        file.lines_deleted,
-                        file.hunk_count,
-                        file.hunk_min_size,
-                        file.hunk_max_size,
-                        file.hunk_avg_size
-                    ));
-            conn.commit()
+                para.add_commit(commit)
+        finally:
+            pass
+            #para.stop()
+
 
 
 #scan_repo_to_csv("D:/src/spring-framework/", "d:/tmp/spring-framework.csv")
