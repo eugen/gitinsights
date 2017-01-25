@@ -9,7 +9,7 @@ CREATE DATABASE git_insights WITH
     id serial CONSTRAINT pk_commit_file_changes PRIMARY KEY,
     commit_sha VARCHAR,
     commit_parent_sha VARCHAR,
-    commit_date DATE,
+    commit_date TIMESTAMP ,
     author_timeofday INT,
     commit_email VARCHAR,
     commit_author VARCHAR,
